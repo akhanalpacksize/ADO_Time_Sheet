@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Any
-from commons import  ADO_Time_log
+from commons import ADO_Time_log
 from config.env import Devops_token, timelog_key
 
 # --- Configuration ---
@@ -28,14 +28,12 @@ BOZNET_FUNCTION_KEY = "29784d26-5ac9-4146-909f-c142590bc417"
 CSV_FIELDNAMES = [
     'workItemId', 'ProductType', 'comment', 'week', 'timeTypeDescription',
     'minutes', 'date', 'month', 'userName', 'createdOn', 'createdBy',
-    'updatedOn', 'updatedBy', 'deletedOn', 'deletedBy'
+    'updatedOn', 'updatedBy', 'deletedOn', 'deletedBy', 'timesheet_state'
 ]
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def load_token(file_path: str) -> str:
-    return Path(file_path).read_text().strip()
 
 def get_auth_headers(token: str) -> Dict[str, str]:
     credentials = base64.b64encode(f':{token}'.encode()).decode()
@@ -43,6 +41,7 @@ def get_auth_headers(token: str) -> Dict[str, str]:
         'Authorization': f'Basic {credentials}',
         'Content-Type': 'application/json'
     }
+
 
 def get_all_work_item_ids(organization: str, project: str, team_area_paths: Dict[str, str], headers: Dict[str, str]) -> List[int]:
     all_ids = []
@@ -59,15 +58,17 @@ def get_all_work_item_ids(organization: str, project: str, team_area_paths: Dict
         all_ids.extend(ids)
     return all_ids
 
+
 def get_work_items_batch(ids: List[int], organization: str, project: str, headers: Dict[str, str]) -> List[Dict]:
     url = f'{AZURE_DEVOPS_URL}/{organization}/{project}/_apis/wit/workitemsbatch?api-version=7.0'
     payload = {
         "ids": ids,
-        "fields": ["System.Id", "Custom.ProductType"]
+        "fields": ["System.Id", "Custom.ProductType", "System.State"]  # <-- Added System.State
     }
     resp = requests.post(url, headers=headers, json=payload)
     resp.raise_for_status()
     return resp.json()['value']
+
 
 def extract_month_name(date_str: str) -> str:
     if not date_str or len(date_str) < 7:
@@ -77,6 +78,7 @@ def extract_month_name(date_str: str) -> str:
         return calendar.month_name[month_num]
     except (ValueError, IndexError):
         return ''
+
 
 def fetch_time_logs_for_work_item(args) -> tuple[int, List[Dict]]:
     wid, api_key, year = args
@@ -94,7 +96,8 @@ def fetch_time_logs_for_work_item(args) -> tuple[int, List[Dict]]:
         return wid, resp.json()
     except Exception as e:
         logger.error(f"Failed to fetch logs for work item {wid}: {e}")
-        return wid, []  # Still return empty list so we write a placeholder row
+        return wid, []
+
 
 def main():
     devops_token = Devops_token
@@ -107,28 +110,31 @@ def main():
     all_ids = get_all_work_item_ids(ORGANIZATION, PROJECT, TEAM_AREA_PATHS, headers)
     logger.info(f"Total work items: {len(all_ids)}")
 
-    # Fetch work item details
+    # Fetch work item details in batches
     work_items = []
     for i in range(0, len(all_ids), 200):
         batch = all_ids[i:i+200]
         work_items.extend(get_work_items_batch(batch, ORGANIZATION, PROJECT, headers))
     logger.info(f"Fetched details for {len(work_items)} work items.")
 
-    id_to_product_type = {
-        item['fields']['System.Id']: item['fields'].get('Custom.ProductType', '')
-        for item in work_items
-    }
+    # Map work item ID to ProductType and State
+    id_to_info = {}
+    for item in work_items:
+        fields = item['fields']
+        wid = fields['System.Id']
+        product_type = fields.get('Custom.ProductType', '')
+        state = fields.get('System.State', '')
+        id_to_info[wid] = {'ProductType': product_type, 'State': state}
 
     csv_file = ADO_Time_log
     with open(csv_file, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
         writer.writeheader()
 
-        # Prepare tasks
+        # Prepare tasks for concurrent time log fetching
         tasks = [(wid, time_log_key, current_year) for wid in all_ids]
         results = {}
 
-        # Fetch logs concurrently
         with ThreadPoolExecutor(max_workers=10) as executor:
             future_to_wid = {executor.submit(fetch_time_logs_for_work_item, task): task[0] for task in tasks}
             for future in as_completed(future_to_wid):
@@ -138,23 +144,28 @@ def main():
         # Write all rows — including those with no logs
         for wid in all_ids:
             logs = results.get(wid, [])
-            product_type = id_to_product_type.get(wid, '')
+            info = id_to_info.get(wid, {'ProductType': '', 'State': ''})
+            product_type = info['ProductType']
+            state = info['State']
 
             if logs:
                 for log in logs:
-                    row = {k: log.get(k, '') for k in CSV_FIELDNAMES if k not in ('workItemId', 'ProductType', 'month')}
+                    row = {k: log.get(k, '') for k in CSV_FIELDNAMES if k not in ('workItemId', 'ProductType', 'state', 'month')}
                     row['workItemId'] = wid
                     row['ProductType'] = product_type
+                    row['timesheet_state'] = state  # <-- From ADO work item
                     row['month'] = extract_month_name(log.get('date', ''))
                     writer.writerow(row)
             else:
-                # Preserve work item even with no logs
+                # Placeholder row for work items with no time logs
                 empty_row = {k: '' for k in CSV_FIELDNAMES}
                 empty_row['workItemId'] = wid
                 empty_row['ProductType'] = product_type
+                empty_row['timesheet_state'] = state  # <-- Still include state
                 writer.writerow(empty_row)
 
     logger.info(f"✅ Output written to {csv_file}")
+
 
 if __name__ == "__main__":
     main()
