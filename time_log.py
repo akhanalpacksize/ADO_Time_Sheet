@@ -1,171 +1,145 @@
 import requests
 import datetime
 import csv
-import base64
 import calendar
-import logging
-from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Any
+from config.env import timelog_key
+from utils import safe_request
 from commons import ADO_Time_log
-from config.env import Devops_token, timelog_key
 
-# --- Configuration ---
-ORGANIZATION = 'packsize'
-PROJECT = 'Packsize Product Development'
-TEAM_AREA_PATHS = {
-    'Team_NABU_RnD_HW_Sustaining': 'Team_NABU_RnD_HW_Sustaining',
-    'Team_RnD_Design': 'Team_RnD_Design',
-    'Team_PLC': 'Team_PLC',
-    'Team_PLC_TechDebt': 'Team_PLC_TechDebt',
-    'Team_PLC_X5N': 'Team_PLC_X5N'
-}
+# -------------------------------------------------------------------
+# Fetch time logs for a work item
+# -------------------------------------------------------------------
+def get_time_logs(work_item_id, api_key, year=None):
+    root_url = "https://boznet-timelogapi.azurewebsites.net/api/"
 
-AZURE_DEVOPS_URL = "https://dev.azure.com"
-BOZNET_API_ROOT = "https://boznet-timelogapi.azurewebsites.net/api"
-BOZNET_FUNCTION_KEY = "29784d26-5ac9-4146-909f-c142590bc417"
+    if year is None:
+        year = datetime.datetime.now().year
 
-CSV_FIELDNAMES = [
-    'workItemId', 'ProductType', 'comment', 'week', 'timeTypeDescription',
-    'minutes', 'date', 'month', 'userName', 'createdOn', 'createdBy',
-    'updatedOn', 'updatedBy', 'deletedOn', 'deletedBy', 'timesheet_state'
-]
+    from_date = f"{year}-01-01T00:00:00"
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+    url = (
+        f"{root_url}29784d26-5ac9-4146-909f-c142590bc417/"
+        f"timelog/query?createdOnFromDate={from_date}&workitemId={work_item_id}"
+    )
 
+    headers = {"x-functions-key": timelog_key}
 
-def get_auth_headers(token: str) -> Dict[str, str]:
-    credentials = base64.b64encode(f':{token}'.encode()).decode()
-    return {
-        'Authorization': f'Basic {credentials}',
-        'Content-Type': 'application/json'
-    }
+    # Use safe_request instead of raw requests.get
+    resp = safe_request("GET", url, headers=headers)
+
+    # 404 means: no logs for this work item → return empty list
+    if resp.status_code == 404:
+        return []
+
+    logs = resp.json()
+    return logs
 
 
-def get_all_work_item_ids(organization: str, project: str, team_area_paths: Dict[str, str], headers: Dict[str, str]) -> List[int]:
-    all_ids = []
-    wiql_url = f'{AZURE_DEVOPS_URL}/{organization}/{project}/_apis/wit/wiql?api-version=7.0'
-    for area_path in team_area_paths.values():
-        wiql_query = {
-            "query": f"SELECT [System.Id] FROM WorkItems "
-                     f"WHERE [System.TeamProject] = '{project}' "
-                     f"AND [System.AreaPath] UNDER '{project}\\\\{area_path}'"
-        }
-        response = requests.post(wiql_url, headers=headers, json=wiql_query)
-        response.raise_for_status()
-        ids = [item['id'] for item in response.json()['workItems']]
-        all_ids.extend(ids)
-    return all_ids
+# -------------------------------------------------------------------
+# Load work items from work_items.csv
+# -------------------------------------------------------------------
+def load_work_items(file_path):
+    items = []
+    with open(file_path, 'r', newline='', encoding='utf-8') as wf:
+        reader = csv.DictReader(wf)
+        fieldnames = reader.fieldnames or []
+        for row in reader:
+            items.append(row)
+    return items, fieldnames
 
 
-def get_work_items_batch(ids: List[int], organization: str, project: str, headers: Dict[str, str]) -> List[Dict]:
-    url = f'{AZURE_DEVOPS_URL}/{organization}/{project}/_apis/wit/workitemsbatch?api-version=7.0'
-    payload = {
-        "ids": ids,
-        "fields": ["System.Id", "Custom.ProductType", "System.State"]  # <-- Added System.State
-    }
-    resp = requests.post(url, headers=headers, json=payload)
-    resp.raise_for_status()
-    return resp.json()['value']
-
-
-def extract_month_name(date_str: str) -> str:
-    if not date_str or len(date_str) < 7:
-        return ''
-    try:
-        month_num = int(date_str[5:7])
-        return calendar.month_name[month_num]
-    except (ValueError, IndexError):
-        return ''
-
-
-def fetch_time_logs_for_work_item(args) -> tuple[int, List[Dict]]:
-    wid, api_key, year = args
-    url = f"{BOZNET_API_ROOT}/{BOZNET_FUNCTION_KEY}/timelog/query"
-    params = {
-        'createdOnFromDate': f"{year}-01-01T00:00:00",
-        'workitemId': wid
-    }
-    headers = {"x-functions-key": api_key}
-    try:
-        resp = requests.get(url, headers=headers, params=params, timeout=10)
-        if resp.status_code == 404:
-            return wid, []
-        resp.raise_for_status()
-        return wid, resp.json()
-    except Exception as e:
-        logger.error(f"Failed to fetch logs for work item {wid}: {e}")
-        return wid, []
-
-
-def main():
-    devops_token = Devops_token
-    time_log_key = timelog_key
-    headers = get_auth_headers(devops_token)
+# -------------------------------------------------------------------
+# Process + Merge Work Items with Time Logs
+# -------------------------------------------------------------------
+def merge_work_items_with_logs(work_items_file):
+    BOZNET_FUNCTION_KEY = "29784d26-5ac9-4146-909f-c142590bc417"
+    work_items, work_item_fieldnames = load_work_items(work_items_file)
 
     current_year = datetime.datetime.now().year
+    # Fields from time log API
+    time_log_fields = [
+        'month',
+        'comment',
+        'timeTypeDescription',
+        'minutes',
+        'date',
+        'workItemId',
+        'createdOn',
+        'createdBy'
+    ]
 
-    logger.info("Fetching all work item IDs...")
-    all_ids = get_all_work_item_ids(ORGANIZATION, PROJECT, TEAM_AREA_PATHS, headers)
-    logger.info(f"Total work items: {len(all_ids)}")
+    # Final CSV columns (merge the two sets)
+    merged_fields = list(work_item_fieldnames) + [
+        f for f in time_log_fields if f not in work_item_fieldnames
+    ]
 
-    # Fetch work item details in batches
-    work_items = []
-    for i in range(0, len(all_ids), 200):
-        batch = all_ids[i:i+200]
-        work_items.extend(get_work_items_batch(batch, ORGANIZATION, PROJECT, headers))
-    logger.info(f"Fetched details for {len(work_items)} work items.")
 
-    # Map work item ID to ProductType and State
-    id_to_info = {}
-    for item in work_items:
-        fields = item['fields']
-        wid = fields['System.Id']
-        product_type = fields.get('Custom.ProductType', '')
-        state = fields.get('System.State', '')
-        id_to_info[wid] = {'ProductType': product_type, 'State': state}
-
-    csv_file = ADO_Time_log
-    with open(csv_file, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+    with open(ADO_Time_log, 'w', newline='', encoding='utf-8') as out_f:
+        writer = csv.DictWriter(out_f, fieldnames=merged_fields)
         writer.writeheader()
 
-        # Prepare tasks for concurrent time log fetching
-        tasks = [(wid, time_log_key, current_year) for wid in all_ids]
-        results = {}
+        for wi in work_items:
 
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_wid = {executor.submit(fetch_time_logs_for_work_item, task): task[0] for task in tasks}
-            for future in as_completed(future_to_wid):
-                wid, logs = future.result()
-                results[wid] = logs
+            wid = (
+                    wi.get('ID') or
+                    wi.get('Id') or
+                    wi.get('workItemId')
+            )
 
-        # Write all rows — including those with no logs
-        for wid in all_ids:
-            logs = results.get(wid, [])
-            info = id_to_info.get(wid, {'ProductType': '', 'State': ''})
-            product_type = info['ProductType']
-            state = info['State']
+            if not wid:
+                continue
 
+            wid_str = str(wid).strip()
+
+            # ---- Get time logs ----
+            logs = get_time_logs(wid_str, BOZNET_FUNCTION_KEY, year=current_year)
+
+            # ProductType fallback
+            product_type = wi.get('ProductType', '')
+
+            # ---- Merge time logs ----
             if logs:
                 for log in logs:
-                    row = {k: log.get(k, '') for k in CSV_FIELDNAMES if k not in ('workItemId', 'ProductType', 'state', 'month')}
-                    row['workItemId'] = wid
-                    row['ProductType'] = product_type
-                    row['timesheet_state'] = state  # <-- From ADO work item
-                    row['month'] = extract_month_name(log.get('date', ''))
+                    row = dict(wi)
+
+                    for fld in time_log_fields:
+                        if fld == 'month':
+                            date_val = log.get('date', '')
+                            month_name = ""
+                            if date_val and len(date_val) >= 7:
+                                try:
+                                    m = int(date_val[5:7])
+                                    month_name = calendar.month_name[m]
+                                except Exception:
+                                    pass
+                            row['month'] = month_name
+                        else:
+                            row[fld] = log.get(fld, "")
+
+                    row['workItemId'] = wid_str
+
+                    if not row.get('ProductType'):
+                        row['ProductType'] = product_type
+
                     writer.writerow(row)
+
             else:
-                # Placeholder row for work items with no time logs
-                empty_row = {k: '' for k in CSV_FIELDNAMES}
-                empty_row['workItemId'] = wid
-                empty_row['ProductType'] = product_type
-                empty_row['timesheet_state'] = state  # <-- Still include state
-                writer.writerow(empty_row)
+                # No logs → write item with empty log fields
+                row = dict(wi)
+                for fld in time_log_fields:
+                    row[fld] = ""
 
-    logger.info(f"✅ Output written to {csv_file}")
+                row['workItemId'] = wid_str
+                if not row.get('ProductType'):
+                    row['ProductType'] = product_type
+
+                writer.writerow(row)
+
+    print(f"\nMerged time logs written to: {ADO_Time_log}")
+    return ADO_Time_log
 
 
-if __name__ == "__main__":
-    main()
+# -------------------------------------------------------------------
+# Run script
+# -------------------------------------------------------------------
+# merge_work_items_with_logs("work_items.csv")

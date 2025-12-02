@@ -6,6 +6,7 @@ from copy import deepcopy, error
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+import time
 
 import pandas
 import requests
@@ -120,6 +121,35 @@ def json_to_dataframe(data_in):
         return rows
 
     return pandas.DataFrame(flatten_json(data_in), dtype=str)
+
+
+
+
+# -----------------------------------------------------
+# Safe API Request Wrapper
+# -----------------------------------------------------
+def safe_request(method, url, max_retries=5, backoff=2, **kwargs):
+    """
+    Robust retry handler for Azure DevOps requests
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.request(method, url, **kwargs)
+
+            # Retry on server-side transient errors
+            if resp.status_code in (500, 502, 503, 504):
+                print(f"[Retry {attempt}/{max_retries}] Server error {resp.status_code} → {url}")
+                time.sleep(backoff ** attempt)
+                continue
+
+            resp.raise_for_status()
+            return resp
+
+        except requests.exceptions.RequestException as e:
+            print(f"[Retry {attempt}/{max_retries}] Request exception: {e}")
+            time.sleep(backoff ** attempt)
+
+    raise Exception(f"Failed after {max_retries} retries: {url}")
 
 
 def get_access_token():
